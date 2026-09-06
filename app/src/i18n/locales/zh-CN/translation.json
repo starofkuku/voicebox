@@ -163,6 +163,10 @@
         "rechecking": "检查中…",
         "stillMissing": "仍未检测到。切换权限后,macOS 通常需要退出并重新打开 Voicebox。"
       }
+    },
+    "pasteFailed": {
+      "title": "无法粘贴转写文字",
+      "body": "文字已转写并保存在「捕获」标签页中,但粘贴到目标应用失败。"
     }
   },
   "voicesTab": {

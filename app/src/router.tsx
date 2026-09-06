@@ -25,6 +25,7 @@ import { Toaster } from '@/components/ui/toaster';
 import { VoicesTab } from '@/components/VoicesTab/VoicesTab';
 import { useGenerationProgress } from '@/lib/hooks/useGenerationProgress';
 import { useModelDownloadToast } from '@/lib/hooks/useModelDownloadToast';
+import { usePasteFailureToast } from '@/lib/hooks/usePasteFailureToast';
 import { MODEL_DISPLAY_NAMES, useRestoreActiveTasks } from '@/lib/hooks/useRestoreActiveTasks';
 
 // Simple platform check that works in both web and Tauri
@@ -37,6 +38,9 @@ function RootLayout() {
 
   // Subscribe to SSE for pending generations — handles completion, auto-play, and history refresh
   useGenerationProgress();
+
+  // Surface dictate auto-paste failures (emitted by the pill window) as toasts
+  usePasteFailureToast();
 
   return (
     <AppFrame>

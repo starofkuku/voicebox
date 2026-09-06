@@ -2,6 +2,26 @@
 use std::process::Command;
 
 fn main() {
+    // Native HUD panel hosting the dictate pill's webview — see
+    // src/pill_panel.m for why this lives in Objective-C instead of
+    // Rust objc-crate calls (struct ABI breakage on arm64).
+    #[cfg(target_os = "macos")]
+    {
+        println!("cargo:rerun-if-changed=src/pill_panel.m");
+        println!("cargo:rustc-link-lib=framework=AppKit");
+        println!("cargo:rustc-link-lib=framework=WebKit");
+        cc::Build::new()
+            .file("src/pill_panel.m")
+            .flag("-fobjc-arc")
+            .compile("pill_panel");
+        // Link the archive by absolute path rather than -l: build-script
+        // `-l static=` was observed to be dropped from the final link line
+        // here, while a direct link-arg always lands after the referencing
+        // objects.
+        let archive = format!("{}/libpill_panel.a", std::env::var("OUT_DIR").unwrap());
+        println!("cargo:rustc-link-arg={}", archive);
+    }
+
     // Link Swift runtime libraries for screencapturekit crate
     #[cfg(target_os = "macos")]
     {

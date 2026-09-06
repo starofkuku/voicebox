@@ -24,6 +24,126 @@ pub const DICTATE_WINDOW_LABEL: &str = "dictate";
 const DICTATE_WINDOW_WIDTH: f64 = 420.0;
 const DICTATE_WINDOW_HEIGHT: f64 = 64.0;
 
+/// Native HUD panel (NSPanel) that hosts the dictate pill's webview.
+///
+/// The pill must render above native fullscreen Spaces. On macOS 15 a plain
+/// NSWindow refuses to join fullscreen Spaces even with
+/// CanJoinAllSpaces | FullScreenAuxiliary and a high window level (verified
+/// experimentally with a standalone test app); NSPanel — the class the
+/// system itself uses for HUD overlays (Spotlight, Raycast, CleanShot) —
+/// joins every Space. Tauri/tao cannot create panels, and Rust objc-crate
+/// calls mis-pass NSRect-sized struct arguments on arm64 (they land in
+/// ___forwarding___ and abort), so the AppKit side lives in
+/// `src/pill_panel.m` (compiled in build.rs) and this module only passes
+/// scalars over the C ABI.
+#[cfg(target_os = "macos")]
+mod pill {
+    use std::sync::Mutex;
+
+    // Must match DICTATE_WINDOW_WIDTH/HEIGHT — the panel hosts the same
+    // React pill, which is laid out against the webview size.
+    const PILL_W: f64 = 420.0;
+    const PILL_H: f64 = 64.0;
+
+    extern "C" {
+        // Provided by src/pill_panel.m. create returns a leaked (+1) panel
+        // pointer — the panel lives for the process lifetime — or NULL when
+        // no WKWebView was found, in which case the webview is untouched.
+        fn voicebox_pill_panel_create(
+            webview_view: *mut std::ffi::c_void,
+            w: f64,
+            h: f64,
+        ) -> *mut std::ffi::c_void;
+        fn voicebox_pill_panel_show(
+            panel: *mut std::ffi::c_void,
+            x: f64,
+            y_cocoa: f64,
+            w: f64,
+            h: f64,
+        );
+        fn voicebox_pill_panel_hide(panel: *mut std::ffi::c_void);
+    }
+
+    extern "C" {
+        fn CGMainDisplayID() -> u32;
+        fn CGDisplayCopyDisplayMode(display: u32) -> *mut std::ffi::c_void;
+        fn CGDisplayModeGetWidth(mode: *mut std::ffi::c_void) -> usize;
+        fn CGDisplayModeGetHeight(mode: *mut std::ffi::c_void) -> usize;
+        fn CGDisplayModeRelease(mode: *mut std::ffi::c_void);
+    }
+
+    // The webview pointer is stashed when the Tauri window is built (any
+    // thread — it's just a stored pointer read); the panel itself is created
+    // lazily on the main thread on first show. PANEL holds 0 until then.
+    static WEBVIEW_VIEW: Mutex<Option<usize>> = Mutex::new(None);
+    static PANEL: Mutex<usize> = Mutex::new(0);
+    static APP: Mutex<Option<tauri::AppHandle>> = Mutex::new(None);
+
+    pub fn init(app: tauri::AppHandle) {
+        *APP.lock().unwrap() = Some(app);
+    }
+
+    pub fn stash_webview(view: *mut std::ffi::c_void) {
+        *WEBVIEW_VIEW.lock().unwrap() = Some(view as usize);
+    }
+
+    /// Position the panel at top-center of the main display and order it
+    /// front without activation. Safe from any thread; falls back to the
+    /// plain Tauri window when the panel can't be created.
+    pub fn show(window: &tauri::WebviewWindow) {
+        let win = window.clone();
+        let _ = window.run_on_main_thread(move || {
+            let mut panel = *PANEL.lock().unwrap();
+            if panel == 0 {
+                let Some(view_addr) = *WEBVIEW_VIEW.lock().unwrap() else {
+                    let _ = win.show();
+                    return;
+                };
+                panel = unsafe {
+                    voicebox_pill_panel_create(view_addr as *mut _, PILL_W, PILL_H) as usize
+                };
+                if panel == 0 {
+                    eprintln!("pill panel: create failed — falling back to plain window");
+                    let _ = win.show();
+                    return;
+                }
+                *PANEL.lock().unwrap() = panel;
+            }
+            unsafe {
+                let display = CGMainDisplayID();
+                let mode = CGDisplayCopyDisplayMode(display);
+                let (screen_w, screen_h) = if mode.is_null() {
+                    (1710.0, 1112.0)
+                } else {
+                    let w = CGDisplayModeGetWidth(mode) as f64;
+                    let h = CGDisplayModeGetHeight(mode) as f64;
+                    CGDisplayModeRelease(mode);
+                    (w, h)
+                };
+                let x = (screen_w - PILL_W) / 2.0;
+                let y_top = screen_h * 0.04;
+                let y_cocoa = screen_h - y_top - PILL_H;
+                voicebox_pill_panel_show(panel as *mut _, x, y_cocoa, PILL_W, PILL_H);
+            }
+        });
+    }
+
+    /// Order the pill panel off screen. Safe from any thread; no-ops when
+    /// the panel was never created (the old window stays hidden regardless).
+    pub fn hide() {
+        let panel = *PANEL.lock().unwrap();
+        if panel == 0 {
+            return;
+        }
+        let Some(app) = APP.lock().unwrap().clone() else {
+            return;
+        };
+        let _ = app.run_on_main_thread(move || unsafe {
+            voicebox_pill_panel_hide(panel as *mut _);
+        });
+    }
+}
+
 /// Create the floating dictate webview hidden. The HotkeyMonitor shows it on
 /// chord-start; the frontend hides it when the capture pipeline finishes.
 /// Building it at setup avoids a race where the first chord or agent-speech
@@ -48,6 +168,17 @@ fn build_dictate_window(app: &tauri::AppHandle) -> tauri::Result<tauri::WebviewW
     .shadow(false)
     .visible(false)
     .build()?;
+
+    // Hand the pill's webview over to the native NSPanel (see `pill`) — the
+    // Tauri window itself is never ordered on screen on macOS.
+    #[cfg(target_os = "macos")]
+    {
+        match window.ns_view() {
+            Ok(view) => pill::stash_webview(view),
+            Err(e) => eprintln!("pill panel: failed to read webview view: {e}"),
+        }
+        pill::init(app.clone());
+    }
 
     if let Some(monitor) = window.current_monitor()? {
         let monitor_size = monitor.size();
@@ -95,29 +226,34 @@ pub fn show_dictate_window(app: &tauri::AppHandle) {
             }
         },
     };
-    // current_monitor() returns None when the window has been parked
-    // off any display by the hide path; fall back to the primary.
-    let monitor = window
-        .current_monitor()
-        .ok()
-        .flatten()
-        .or_else(|| window.primary_monitor().ok().flatten());
-    if let Some(monitor) = monitor {
-        let monitor_pos = monitor.position();
-        let monitor_size = monitor.size();
-        if let Ok(win_size) = window.outer_size() {
-            let x = monitor_pos.x
-                + (monitor_size.width as i32 - win_size.width as i32) / 2;
-            let y = monitor_pos.y + (monitor_size.height as f64 * 0.04) as i32;
-            let _ = window.set_position(PhysicalPosition::new(x, y));
+    #[cfg(target_os = "macos")]
+    pill::show(&window);
+    #[cfg(not(target_os = "macos"))]
+    {
+        // current_monitor() returns None when the window has been parked
+        // off any display by the hide path; fall back to the primary.
+        let monitor = window
+            .current_monitor()
+            .ok()
+            .flatten()
+            .or_else(|| window.primary_monitor().ok().flatten());
+        if let Some(monitor) = monitor {
+            let monitor_pos = monitor.position();
+            let monitor_size = monitor.size();
+            if let Ok(win_size) = window.outer_size() {
+                let x = monitor_pos.x
+                    + (monitor_size.width as i32 - win_size.width as i32) / 2;
+                let y = monitor_pos.y + (monitor_size.height as f64 * 0.04) as i32;
+                let _ = window.set_position(PhysicalPosition::new(x, y));
+            }
         }
+        // Skip on Linux: tao's CursorIgnoreEvents handler unwraps the GdkWindow,
+        // which is None until the window is first shown, aborting the process.
+        // The click-through toggle is a macOS workaround and is never set on Linux.
+        #[cfg(not(target_os = "linux"))]
+        let _ = window.set_ignore_cursor_events(false);
+        let _ = window.show();
     }
-    // Skip on Linux: tao's CursorIgnoreEvents handler unwraps the GdkWindow,
-    // which is None until the window is first shown, aborting the process.
-    // The click-through toggle is a macOS workaround and is never set on Linux.
-    #[cfg(not(target_os = "linux"))]
-    let _ = window.set_ignore_cursor_events(false);
-    let _ = window.show();
 }
 
 const LEGACY_PORT: u16 = 8000;
@@ -1204,22 +1340,28 @@ fn open_input_monitoring_settings(app: tauri::AppHandle) -> Result<(), String> {
 /// clipboard stuck on the transcript.
 ///
 /// Skips (returns `false`) without touching anything when:
-/// - `focus.bundle_id` is Voicebox itself — step 6 will inject directly
-///   into our own webview; pasting would just double-insert or miss the
-///   real target.
+/// - the resolved `focus.bundle_id` is Voicebox itself — step 6 will inject
+///   directly into our own webview; pasting would just double-insert or
+///   miss the real target.
 /// - Accessibility is not trusted — `CGEventPost` would silently drop the
 ///   keystroke, leaving the user's clipboard clobbered with nothing to
 ///   show for it.
+///
+/// `focus` may be `None`: the chord-start snapshot is missing when the AX
+/// query failed at that moment (Chromium/Electron builds their
+/// accessibility tree lazily, so first queries commonly fail). In that case
+/// re-query now — the dictate pill never takes key focus, so the frontmost
+/// app is still the dictation target in the common case. If even the
+/// re-query fails, paste without activation: the frontmost app receives the
+/// ⌘V. Skipping outright guarantees non-delivery, which is the worse
+/// outcome for dictation.
 ///
 /// Returns `true` when the paste sequence completed end-to-end.
 #[command]
 async fn paste_final_text(
     text: String,
-    focus: focus_capture::FocusSnapshot,
+    focus: Option<focus_capture::FocusSnapshot>,
 ) -> Result<bool, String> {
-    if focus.bundle_id.as_deref() == Some(VOICEBOX_BUNDLE_ID) {
-        return Ok(false);
-    }
     if !accessibility::is_trusted() {
         return Err(
             "Accessibility permission required for auto-paste. Open System Settings → Privacy & Security → Accessibility and enable Voicebox."
@@ -1227,7 +1369,21 @@ async fn paste_final_text(
         );
     }
 
-    focus_capture::activate_pid(focus.pid)?;
+    let focus = match focus {
+        Some(f) => Some(f),
+        None => focus_capture::capture_focus().ok(),
+    };
+
+    if let Some(ref f) = focus {
+        if f.bundle_id.as_deref() == Some(VOICEBOX_BUNDLE_ID) {
+            return Ok(false);
+        }
+    }
+
+    if let Some(ref f) = focus {
+        focus_capture::activate_pid(f.pid)?;
+        tokio::time::sleep(std::time::Duration::from_millis(POST_ACTIVATE_SETTLE_MS)).await;
+    }
     tokio::time::sleep(std::time::Duration::from_millis(POST_ACTIVATE_SETTLE_MS)).await;
 
     let snapshot = clipboard::save_clipboard()?;
@@ -1421,9 +1577,15 @@ pub fn run() {
                 // steals focus to the Voicebox app when the user clicks
                 // where it used to be. Park the window off-screen and mark
                 // it click-through as well, so even if `hide()` no-ops the
-                // user sees and interacts with nothing.
+                // user sees and interacts with nothing. (macOS hosts the
+                // pill in the native NSPanel instead — see `pill` — so only
+                // the panel needs ordering out there.)
+                #[cfg(not(target_os = "macos"))]
                 let handle_for_hide = app.handle().clone();
                 app.handle().listen("dictate:hide", move |_event| {
+                    #[cfg(target_os = "macos")]
+                    pill::hide();
+                    #[cfg(not(target_os = "macos"))]
                     if let Some(window) = handle_for_hide.get_webview_window(DICTATE_WINDOW_LABEL) {
                         // Skip on Linux: aborts if the window was never realized
                         // (see show_dictate_window).

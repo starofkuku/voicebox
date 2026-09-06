@@ -49,16 +49,21 @@ export function DictateWindow() {
       // refine-result firing a paste after the user has moved on.
       focusRef.current = null;
       if (!allowAutoPaste) return;
-      if (!focus || !text.trim()) return;
+      if (!text.trim()) return;
+      // A null focus is not fatal: paste_final_text re-queries the focused
+      // element at paste time and falls back to the frontmost app.
       try {
-        await invoke('paste_final_text', { text, focus });
+        await invoke('paste_final_text', { text, focus: focus ?? null });
       } catch (err) {
         // Surface accessibility failures to the main window so it can prompt
-        // the user to grant permission. Other errors stay swallowed —
-        // the transcription still landed in the captures list.
+        // the user to grant permission. Other paste failures emit a toast
+        // event — silent loss made every AX hiccup look like "dictation
+        // didn't work" with nothing to debug.
         const msg = err instanceof Error ? err.message : String(err);
         if (/accessibility/i.test(msg)) {
           emit('system:accessibility-missing').catch(() => {});
+        } else {
+          emit('dictate:paste-failed', { message: msg }).catch(() => {});
         }
         console.warn('[dictate] paste_final_text failed:', err);
       }
@@ -141,9 +146,7 @@ export function DictateWindow() {
     audio.onplaying = () => {
       emit('dictate:show').catch(() => {});
       setSpeaking((prev) =>
-        prev && prev.generationId === generationId
-          ? { ...prev, startedAt: Date.now() }
-          : prev,
+        prev && prev.generationId === generationId ? { ...prev, startedAt: Date.now() } : prev,
       );
       setSpeakElapsed(0);
     };
